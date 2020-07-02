@@ -31,21 +31,11 @@
 #include "lwip/dns.h"
 
 #include "esp_tls.h"
+#include "esp_log.h"
+#include "mqtt.h"
+#include "http_get.h"
 
 static const char *TAG = "smartdemon_example";
-
-/* Constants that aren't configurable in menuconfig */
-#define WEB_SERVER "api.thinkpage.cn"
-#define WEB_PORT 80
-#define WEB_URL "https://api.thinkpage.cn/v3/weather/now.json?key=wcmquevztdy1jpca&location=wuxi&language=en&unit=c"
-
-
-static const char *REQUEST = "GET " WEB_URL " HTTP/1.0\r\n"
-    "Host: "WEB_SERVER"\r\n"
-    "User-Agent: esp-idf/1.0 esp32\r\n"
-    "\r\n";
-
-static void http_get_task(void *pvParameters);
 
 
 /* FreeRTOS event group to signal when we are connected & ready to make a request */
@@ -58,23 +48,53 @@ static const int CONNECTED_BIT = BIT0;
 static const int ESPTOUCH_DONE_BIT = BIT1;
 
 static void smartconfig_example_task(void * parm);
+static void saveWifiConfig(wifi_config_t *wifi_config);
+static esp_err_t readWifiConfig(wifi_config_t *sta_config);
+
 
 static void event_handler(void* arg, esp_event_base_t event_base, 
                                 int32_t event_id, void* event_data)
 {
     if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        xTaskCreate(smartconfig_example_task, "smartconfig_example_task", 4096, NULL, 3, NULL);
+
+        /**< ESP32 sta 启动 */
+        ESP_LOGI(TAG, "ESP32 STA START");
+
+        wifi_config_t wifi_config;
+        esp_err_t err = readWifiConfig(&wifi_config);
+ 
+        if (err == ESP_ERR_NVS_NOT_FOUND)
+        {
+            xTaskCreate(smartconfig_example_task, "smartconfig_example_task", 4096, NULL, 3, NULL);
+        }
+        else if (err == ESP_OK)
+        {
+            ESP_LOGI(TAG, "readWifiConfig ESP_OK");
+
+            ESP_ERROR_CHECK( esp_wifi_disconnect() );
+            ESP_ERROR_CHECK( esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config) );
+            ESP_ERROR_CHECK( esp_wifi_connect() );
+        }
+    } else if (event_base == WIFI_EVENT && event_id == SYSTEM_EVENT_STA_CONNECTED) {
+        ESP_LOGI(TAG, "ESP32 STA Connected AP");
     } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        esp_wifi_connect();
+        ESP_LOGI(TAG, "ESP32 STA Disconnected AP");
+        ESP_ERROR_CHECK(esp_wifi_connect() );
         xEventGroupClearBits(s_wifi_event_group, CONNECTED_BIT);
     } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        ESP_LOGI(TAG, "ESP32 STA GET IP FROM AP");
         xEventGroupSetBits(s_wifi_event_group, CONNECTED_BIT);
+
+        //app main
+        http_get_app_start();
+        //mqtt
+        mqtt_app_start();
     } else if (event_base == SC_EVENT && event_id == SC_EVENT_SCAN_DONE) {
-        ESP_LOGI(TAG, "Scan done");
+        ESP_LOGI(TAG, "SmartConfig Scan done");
     } else if (event_base == SC_EVENT && event_id == SC_EVENT_FOUND_CHANNEL) {
-        ESP_LOGI(TAG, "Found channel");
+        ESP_LOGI(TAG, "SmartConfig Found channel");
     } else if (event_base == SC_EVENT && event_id == SC_EVENT_GOT_SSID_PSWD) {
-        ESP_LOGI(TAG, "Got SSID and password");
+        ESP_LOGI(TAG, "SmartConfig Got SSID and password");
 
         smartconfig_event_got_ssid_pswd_t *evt = (smartconfig_event_got_ssid_pswd_t *)event_data;
         wifi_config_t wifi_config;
@@ -97,9 +117,50 @@ static void event_handler(void* arg, esp_event_base_t event_base,
         ESP_ERROR_CHECK( esp_wifi_disconnect() );
         ESP_ERROR_CHECK( esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config) );
         ESP_ERROR_CHECK( esp_wifi_connect() );
+
+        //save wifi param
+        saveWifiConfig(&wifi_config);
     } else if (event_base == SC_EVENT && event_id == SC_EVENT_SEND_ACK_DONE) {
         xEventGroupSetBits(s_wifi_event_group, ESPTOUCH_DONE_BIT);
+    } else{
+        ESP_LOGI(TAG, "event_id :%d ", event_id);
     }
+}
+
+static void saveWifiConfig(wifi_config_t *wifi_config)
+{
+    //ESP_ERROR_CHECK(nvs_flash_init());
+    nvs_handle my_handle;
+    nvs_open("WIFI_CONFIG", NVS_READWRITE, &my_handle);
+ 
+    ESP_ERROR_CHECK(nvs_set_blob(my_handle, "wifi_config", wifi_config, sizeof(wifi_config_t)));
+ 
+    ESP_ERROR_CHECK(nvs_commit(my_handle));
+    nvs_close(my_handle);
+}
+ 
+static esp_err_t readWifiConfig(wifi_config_t *sta_config)
+{
+    //ESP_ERROR_CHECK(nvs_flash_init());
+    nvs_handle my_handle;
+    nvs_open("WIFI_CONFIG", NVS_READWRITE, &my_handle);
+  
+    uint32_t len = sizeof(wifi_config_t);
+    esp_err_t err = nvs_get_blob(my_handle, "wifi_config", sta_config, &len);
+ 
+    nvs_close(my_handle);
+ 
+    return err;
+}
+
+static void deleteWifiConfig()
+{
+    //ESP_ERROR_CHECK(nvs_flash_init());
+    nvs_handle my_handle;
+    nvs_open("WIFI_CONFIG", NVS_READWRITE, &my_handle);
+    ESP_ERROR_CHECK(nvs_flash_erase_partition("WIFI_CONFIG") );
+ 
+    nvs_close(my_handle);
 }
 
 static void initialise_wifi(void)
@@ -131,8 +192,6 @@ static void smartconfig_example_task(void * parm)
         uxBits = xEventGroupWaitBits(s_wifi_event_group, CONNECTED_BIT | ESPTOUCH_DONE_BIT, true, false, portMAX_DELAY); 
         if(uxBits & CONNECTED_BIT) {
             ESP_LOGI(TAG, "WiFi Connected to ap");
-
-            xTaskCreate(&http_get_task, "http_get_task", 8192, NULL, 5, NULL);
         }
         if(uxBits & ESPTOUCH_DONE_BIT) {
             ESP_LOGI(TAG, "smartconfig over");
@@ -142,148 +201,20 @@ static void smartconfig_example_task(void * parm)
     }
 }
 
-void cjson_to_struct_info(char *text)
-{
-    //截取有效json
-    printf("JSON DATA:\n %s \n",text);
-    char *index=strchr(text,'{');
-    strcpy(text,index);
-
-    cJSON *pJsonRoot = cJSON_Parse(text);
-    //如果是否json格式数据
-    if (pJsonRoot ==NULL) {
-        cJSON_Delete(pJsonRoot);
-        ESP_LOGI(TAG, "Read is not Json data \n");
-        return;
-    }
-
-    //解析results字段字符串内容
-    cJSON *pResultsArrayItem = cJSON_GetObjectItem(pJsonRoot, "results");
-    if (pResultsArrayItem) {
-        if (cJSON_IsString(pResultsArrayItem))
-            ESP_LOGI(TAG, "get results:%s \n", pResultsArrayItem->valuestring);
-    } else
-        ESP_LOGI(TAG, "get results failed \n");
-
-    //解析results字段字符串内容
-    cJSON *pObjectJson = cJSON_GetArrayItem(pResultsArrayItem, 0);
-    if (pObjectJson) {
-        if (cJSON_IsString(pObjectJson))
-            ESP_LOGI(TAG, "get index 0:%s \n", pObjectJson->valuestring);
-    } else
-        ESP_LOGI(TAG, "get index 0 failed \n");
-
-    //解析now字段字符串内容
-    cJSON *pNowData = cJSON_GetObjectItem(pObjectJson, "now");
-    if (pNowData) {
-        if (cJSON_IsString(pNowData))
-            ESP_LOGI(TAG, "get now:%s \n", pNowData->valuestring);
-    } else
-        ESP_LOGI(TAG, "get now failed \n");
-
-    //解析temperature字段字符串内容
-    cJSON *pTemperatureData = cJSON_GetObjectItem(pNowData, "temperature");
-    if (pTemperatureData) {
-        if (cJSON_IsString(pTemperatureData))
-            ESP_LOGI(TAG, "WUXI Temperature:%s \n", pTemperatureData->valuestring);
-    } else
-        ESP_LOGI(TAG, "get Temperature failed \n");
-
-    cJSON_Delete(pJsonRoot);    
-}
-
-static void http_get_task(void *pvParameters)
-{
-    const struct addrinfo hints = {
-        .ai_family = AF_INET,       // IPV4
-        .ai_socktype = SOCK_STREAM, // TCP协议
-    };
-    struct addrinfo *res;
-    struct in_addr *addr;
-    int s, r;
-    char recv_buf[1024] = "\0";
-    char mid_buf[1024] = "\0";
-    while(1) {
-        int err = getaddrinfo(WEB_SERVER, "80", &hints, &res);
-
-        if(err != 0 || res == NULL) {
-            ESP_LOGE(TAG, "DNS lookup failed err=%d res=%p", err, res);
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
-            continue;
-        }
-
-        /* Code to print the resolved IP.
-
-        Note: inet_ntoa is non-reentrant, look at ipaddr_ntoa_r for "real" code */
-        addr = &((struct sockaddr_in *)res->ai_addr)->sin_addr;
-        ESP_LOGI(TAG, "DNS lookup succeeded. IP=%s", inet_ntoa(*addr));
-
-        s = socket(res->ai_family, res->ai_socktype, 0);
-        if(s < 0) {
-            ESP_LOGE(TAG, "... Failed to allocate socket.");
-            freeaddrinfo(res);
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
-            continue;
-        }
-        ESP_LOGI(TAG, "... allocated socket");
-
-        if(connect(s, res->ai_addr, res->ai_addrlen) != 0) {
-            ESP_LOGE(TAG, "... socket connect failed errno=%d", errno);
-            close(s);
-            freeaddrinfo(res);
-            vTaskDelay(4000 / portTICK_PERIOD_MS);
-            continue;
-        }
-
-        ESP_LOGI(TAG, "... connected");
-        freeaddrinfo(res);
-
-        printf("REQUEST: %s\n", REQUEST);
-        if (write(s, REQUEST, strlen(REQUEST)) < 0) {
-            ESP_LOGE(TAG, "... socket send failed");
-            close(s);
-            vTaskDelay(4000 / portTICK_PERIOD_MS);
-            continue;
-        }
-        ESP_LOGI(TAG, "... socket send success");
-
-        struct timeval receiving_timeout;
-        receiving_timeout.tv_sec = 5;
-        receiving_timeout.tv_usec = 0;
-        if (setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &receiving_timeout,
-                sizeof(receiving_timeout)) < 0) {
-            ESP_LOGE(TAG, "... failed to set socket receiving timeout");
-            close(s);
-            vTaskDelay(4000 / portTICK_PERIOD_MS);
-            continue;
-        }
-        ESP_LOGI(TAG, "... set socket receiving timeout success");
-
-        /* Read HTTP response */
-        memset(mid_buf,0,sizeof(mid_buf));
-        do {
-            bzero(recv_buf, sizeof(recv_buf));
-            r = read(s, recv_buf, sizeof(recv_buf)-1);
-            //printf("%s\n",recv_buf);
-            strcat(mid_buf,recv_buf);
-        } while(r > 0);
-
-        ESP_LOGI(TAG, "... done reading from socket. Last read return=%d errno=%d\r\n", r, errno);
-        close(s);
-
-        cjson_to_struct_info(mid_buf);
-
-        for(int countdown = 10; countdown >= 0; countdown--) {
-            ESP_LOGI(TAG, "%d... ", countdown);
-            vTaskDelay(1000 / portTICK_PERIOD_MS);
-        }
-        ESP_LOGI(TAG, "Starting again!");
-    }
-}
-
-
 void app_main(void)
 {
+    ESP_LOGI(TAG, "[APP] Startup..");
+    ESP_LOGI(TAG, "[APP] Free memory: %d bytes", esp_get_free_heap_size());
+    ESP_LOGI(TAG, "[APP] IDF version: %s", esp_get_idf_version());
+
+    esp_log_level_set("*", ESP_LOG_INFO);
+    esp_log_level_set("MQTT_CLIENT", ESP_LOG_VERBOSE);
+    esp_log_level_set("MQTT_EXAMPLE", ESP_LOG_VERBOSE);
+    esp_log_level_set("TRANSPORT_TCP", ESP_LOG_VERBOSE);
+    esp_log_level_set("TRANSPORT_SSL", ESP_LOG_VERBOSE);
+    esp_log_level_set("TRANSPORT", ESP_LOG_VERBOSE);
+    esp_log_level_set("OUTBOX", ESP_LOG_VERBOSE);
+
     ESP_ERROR_CHECK( nvs_flash_init() );
 
     initialise_wifi();
